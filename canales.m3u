@@ -174,3 +174,491 @@ http://iphone-streaming.ustream.tv/uhls/6540154/streams/live/iphone/playlist.m3u
 
 #EXTINF:-1 tvg-logo="http://chileiptv.cl/img/logos/sinlogo.png" group-title="Chileiptv" , Wow
 http://cdn.elsalvadordigital.com:1935/wowtv/wowtv/playlist.m3u8?
+
+
+
+
+
+
+
+const task = require('./createTask');
+const Firestore = require('@google-cloud/firestore');
+const https = require('https');
+//const rp = require('request-promise');
+const firebase = require('firebase-admin');
+const functions = require("firebase-functions");
+
+const geolib = require('geolib');
+//const polyUtil = require('node-geometry-library')
+//const PolyUtil = require('../node_modules/node-geometry-library');
+//import {SphericalUtil, PolyUtil} from "node-geometry-library"; //libreria para poligonos https://www.npmjs.com/package/node-geometry-library
+
+var HOST = 'very-send-fcm-message-6moe6vzk5q-uc.a.run.app'
+const MAX_SCHEDULE_LIMIT = 15 * 60 * 1000; // Represents 15 MINS in milliseconds.
+
+const firestore = new Firestore({
+  projectId: process.env.GOOGLE_CLOUD_PROJECT,
+});
+
+firebase.initializeApp()
+
+
+exports.veryAddCodesForOrders = functions.pubsub
+    .schedule('every 1 minutes')
+    .onRun(async (context) => {
+        const codesRef = firestore.collection("codes_orders")
+        const codes = await codesRef.get()
+        const codesSize = codes.size
+        const date = new Date()
+        const lastDate = date.getFullYear().toString().substring(3)
+        var endId = 0
+
+        functions.logger.info(lastDate);
+    
+        if (codesSize < 5) {
+            const code = await codesRef.doc("codeEnd").get()
+            var id = 0
+
+            if (!code.exists) {
+                id = lastDate + "0001"
+            } else {
+                id = code.data().id
+            }
+            
+            functions.logger.info(endId.toString().substring(0, 1) + " ya");
+            
+            if (lastDate == id.toString().substring(0, 1)) {
+                endId = parseInt(id)
+            } else {
+                endId = parseInt(lastDate + "0001")
+            }                
+            
+
+            var aux = endId
+            //var docPath = aux.toString()
+            var codeNew = ""
+
+            for(var i = 0; i < 20 - codesSize; i++) {
+                aux = endId + i
+                codeNew = "RV" + aux
+
+                var data = {
+                    id : codeNew,
+                    status: true
+                }
+
+                await codesRef.doc(codeNew).set(data);
+            }
+
+            await firestore.collection("codes_orders").doc("codeEnd").set({id: codeNew, status: false});
+        }
+
+        return null;
+    });
+
+
+exports.veryNewOrder= functions.firestore.document('/empresas/{empresaId}/comercios/{comercioId}/orders/{orderId}')
+.onCreate(async (snap, context) => {
+    var queryCodeOrder = await firestore.collection("codes_orders").where('status', '==', true).orderBy("id", "asc").limit(1).get()
+    var docCodeOrder = queryCodeOrder.docs[0]
+    var queryTienda = await snap.data().comercio.ref.get()
+    var queryCustomer = await snap.data().customer.ref.get()
+    const customer = customerData(queryCustomer.data())
+    const tienda = tiendaData(queryTienda.data())
+    const order = orderData(snap.data())
+    const queryMaster = await firestore.collection("accounts").doc("very-masters").collection("account").where('profile.ciudad', '==', order.customer.city).get()
+    const master = masterData(queryMaster.docs[0].data())
+
+    if (order.id != "") {
+        return null
+    } 
+
+
+    return docCodeOrder.ref.delete().then(doc => {
+
+        setCodeOrder(order.ref, docCodeOrder.data().id)
+
+        var notificationVery = buildMessage('Pedido Enviado', 'tu pedido a sido enviado a tienda, espera la confirmación', customer.fcm, "VERY_ORDER_NOTIFICATION", "gota.mp3", ".MapsActivity")
+        sendMessage(notificationVery)
+        var notificationTienda = buildMessage('Nuevo pedido', 'ha llegado un nuevo pedido ' + docCodeOrder.data().id, tienda.fcm, "VERY_NEGOCIO", "newOrder.mp3", ".IntroActivity")
+        sendMessage(notificationTienda)
+        var notificationMaster = buildMessage('Nuevo pedido', 'ha llegado un nuevo pedido para ' + tienda.name, master.fcm, "VERY_MASTER", "newOrder.mp3", ".LoginActivity")
+        sendMessage(notificationMaster)        
+    })
+})
+
+
+function sendMessage(fcmMessage) {
+    console.log(fcmMessage);
+    var options = {
+        hostname: HOST,
+        path: '/',
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json'
+        }
+        // … plus the body of your notification or data message
+    };
+    var request = https.request(options, function(resp) {
+        resp.setEncoding('utf8');
+        resp.on('data', function(data) {
+            console.log('Message sent to Firebase for delivery, response:');
+            console.log(data);
+        });
+    });
+    request.on('error', function(err) {
+        console.log('Unable to send message to Firebase');
+        console.log(err);
+    });
+    request.write(JSON.stringify(fcmMessage));
+    request.end();
+}
+
+
+function buildMessage(title, body, fcm, channel, sound, action) {
+    const notification = {
+        title: title,
+        body: body
+    }
+
+    const data = {
+        channel: channel
+    }
+
+    const androidNotification = {
+        click_action: action,
+        icon: "logo",
+        sound: sound,
+        color: "#7e55c3",
+        channel_id: channel
+    }
+
+    const android = {
+        direct_boot_ok: true,
+        notification: androidNotification
+    }
+
+    const message = {
+        token: fcm,
+        notification: notification,
+        data: data,
+        android: android
+    }
+    
+    return {message}
+}
+
+
+exports.veryUpdateOrder = functions.firestore.document('/empresas/{empresaId}/comercios/{comercioId}/orders/{orderId}')
+.onUpdate(async (change, context) => {
+
+    const order = orderData(change.after.data())
+    const customerQuery = await order.customer.ref.get()
+    const customer = customerData(customerQuery.data())
+    const tiendaQuery = await order.comercio.ref.get()
+    const tienda = tiendaData(tiendaQuery.data())
+    const queryMaster = await firebase.firestore().collection("accounts").doc("very-masters").collection("account").where('profile.ciudad', '==', tienda.city).get()
+    const master = masterData(queryMaster.docs[0].data())
+    const ref = order.ref.path
+
+
+    if (order.status == "TIENDA" && change.before.data().status == "PENDIENTE") {     
+        const type = "STATUS"
+        const timeExecute = 60000
+        const timeNow = Date.now()
+        const payload = {ref, type}
+        
+        const expirationTask = await task.createHttpTaskWithToken(
+            payload,
+            timeExecute,
+            timeNow
+        )
+
+        await setTaskOrder(order.ref, expirationTask)
+
+        const notificationVery = buildMessage("Acepta el tiempo de espera", "¡Tu pedido de " + order.comercio.name + " estará listo en " + (order.millisTienda / 1000) / 60 + " minutos", customer.fcm, "VERY_ORDER_ACCEPT", "acceptOrder.mp3", "")
+        return sendMessage(notificationVery)
+
+
+    } else if (order.status == "CONFIRMADO" && change.before.data().status == "TIENDA") {
+        
+        if (order.millisTienda > MAX_SCHEDULE_LIMIT) {
+            const type = "ALARM"
+            const timeExecute = order.millisTienda - 720000
+            const timeNow = Date.now()
+            const payload = {ref, type}
+        
+            const expirationTask = await task.createHttpTaskWithToken(
+                payload,
+                timeExecute,
+                timeNow
+            )
+
+            await setTaskOrder(order.ref, expirationTask)
+        }
+        
+
+        var notificationVery = buildMessage('Tu pedido esta preparándose', "¡Tu pedido de " + order.comercio.name + " estará listo en " + (order.millisTienda / 1000) / 60 + " minutos", customer.fcm, "VERY_ORDER_NOTIFICATION", "gota.mp3", ".MapsActivity")
+        sendMessage(notificationVery)
+
+        var notificationTienda = buildMessage('Pedido Confirmado', customer.name + " confirmó el pedido", tienda.fcm, "VERY_NEGOCIO_CONFIRMACION", "newOrder.mp3", ".LoginActivity")
+        sendMessage(notificationTienda)   
+  
+        var notificatioMaster = buildMessage('Pedido programado', 'tiene un pedido programado de ' + tienda.name, master.fcm, "VERY_MASTER_CONFIRMACION", "newOrder.mp3", ".LoginActivity")
+        sendMessage(notificatioMaster)   
+
+        try {
+            await task.deleteHttpTask(change.after.data().expirationTask)
+        
+        } catch (error) {
+            console.error(Error(error.message));
+            return
+        }
+
+        return
+
+    } else if (order.status == "ASIGNADO" && change.before.data().status != "ASIGNADO") {     
+        const repartidorQuery = await order.repartidor.ref.get()
+        const ranger = rangerData(repartidorQuery.data())
+
+        const notificationRanger = buildMessage("Pedido Nuevo", "¡Pedido asignado " + tienda.name, ranger.fcm, "RANGER_PEDIDO_NUEVO", "acceptOrder.mp3", ".IntroActivity")
+        sendMessage(notificationRanger)
+
+        const notificationVery = buildMessage("Repartidor asignado", ranger.name + " llevará tu pedido", customer.fcm, "VERY_ORDER_ACCEPT", "acceptOrder.mp3", "")
+        sendMessage(notificationVery)
+
+        return
+
+    } else if (order.status == "ACEPTADO" && change.before.data().status != "ACEPTADO") {   
+        if (order.repartidor != null) {
+            try {
+                await task.deleteHttpTask(change.after.data().expirationTask)
+            
+            } catch (error) {
+                console.error(Error(error.message));
+                return
+            }
+        }
+
+        return
+
+    } else if (order.status == "LISTO" && change.before.data().status != "LISTO") {     
+        const repartidor = order.repartidor
+
+        if (repartidor != null) {
+            const repartidorQuery = await order.repartidor.ref.get()
+            const ranger = rangerData(repartidorQuery.data())
+
+            const notificationRanger = buildMessage("Pedido Listo", "¡El pedido de " + tienda.name + " esta esperando que lo recojas", ranger.fcm, "RANGER_PEDIDO_NUEVO", "acceptOrder.mp3", ".IntroActivity")
+            sendMessage(notificationRanger)
+        }
+
+        const notificatioMaster = buildMessage('Pedido Listo', 'Pedido listo de ' + tienda.name, master.fcm, "VERY_MASTER_CONFIRMACION", "newOrder.mp3", ".LoginActivity")
+        sendMessage(notificatioMaster)  
+
+        await change.after.ref.update({
+            expirationTask: firebase.firestore.FieldValue.delete()
+        })
+
+        try {
+            await task.deleteHttpTask(change.after.data().expirationTask)
+        
+        } catch (error) {
+            console.error(Error(error.message));
+            return
+        }
+        
+        return
+    }
+    
+    return null
+})
+
+
+const setCodeOrder = function(ref, data) {
+    ref.set({
+        order: {
+            id: data
+        } 
+    }, {merge: true})
+}
+
+
+const setTaskOrder = async function(ref, data) {
+    await ref.set({
+        expirationTask: data
+    }, {merge: true})
+}
+
+
+const customerData = function(data) {
+    const customer = {
+        address: data.address,
+        fcm: data.fcm,
+        name: data.name
+    }
+
+    return customer
+}
+
+const rangerData = function(data) {
+    const customer = {
+        address: data.address,
+        city: data.city.locality,
+        fcm: data.fcm,
+        name: data.profile.name + " " + data.profile.lastName
+    }
+
+    return customer
+}
+
+const tiendaData = function(data) {
+    const tienda = {
+        address: data.address,
+        city: data.city.locality,
+        fcm: data.fcm,
+        name: data.nombre
+    }
+
+    return tienda
+}
+
+const masterData = function(data) {
+    const master = {
+        city: data.profile.ciudad,
+        fcm: data.fcm,
+        name: data.profile.name
+    }
+
+    return master
+}
+
+const orderData = function(data) {
+    var repartidor = null
+  
+    if (data.repartidor != null) {
+        repartidor = {
+            name: data.repartidor.name,
+            ref: data.repartidor.ref
+        }
+    }
+    
+    const order = {
+        id: data.order.id,
+        customer: {
+            name: data.customer.name,
+            ref: data.customer.ref,
+            city: data.customer.location.city
+        },
+        comercio: {
+            name: data.comercio.name,
+            ref: data.comercio.ref,
+            city: data.comercio.location.city
+        },
+        repartidor: repartidor,
+        ref: data.thisRef,
+        millisTienda: data.millisTienda,
+        status: data.status,
+        timePreparation: data.timePreparation
+    }
+  
+    return order
+  }
+
+
+
+const storeData = async function(snap) {
+    var cat = await snap.data().sectorEconomico.get()
+
+    const tienda = {
+        name: snap.data().nombre,
+        city: snap.data().city.subadmin,
+        reference: snap.ref.path,
+        id: snap.data().id,
+        categoria: cat.data().name,
+        abierto: snap.data().abierto
+    }
+
+    return tienda
+}
+
+
+
+exports.veryWriteComercio = functions.firestore.document('/empresas/{empresaId}/comercios/{comercioId}')
+.onWrite(async (change, context) => {
+        
+        let store = await storeData(change.after)
+        var queryCustomers = await firestore.collectionGroup("clientes").where('address.city', '==', store.city).get()
+        
+        queryCustomers.forEach(async (doc) => {
+            //doc.ref.set(store, {merge: true})
+            const areasStore = change.after.data().areas
+            const locationCustomer = doc.data().address.location
+
+            console.log(doc.data().id, ' => ', doc.data().name);            
+
+            for (const data of areasStore) {
+                console.log(data['name'])
+                var areas = []
+
+                for (const point of data['distributionArea']) {
+                    const latLng = { latitude: point.latitude, longitude: point.longitude }
+                    areas.push(latLng)
+                }
+                 
+                const response = geolib.isPointInPolygon({ latitude: locationCustomer.latitude, longitude: locationCustomer.longitude }, areas);
+                console.log(response)
+
+                if (response) {
+                    var queryStoresSearchs = await doc.ref.collection("stores_copy").doc(context.params.comercioId)
+                    queryStoresSearchs.set(store, {merge: true})
+                    
+                    return
+                }
+            }
+        });
+
+        return 
+  })
+
+
+exports.veryWriteCliente = functions.firestore.document('/clientes/{clienteId}')
+  .onWrite(async (change, context) => {
+    
+    let customerBefore = change.before.data()
+    let customerAfter = change.after.data()
+
+    if (customerBefore.address.location != customerAfter.address.location){
+        var storesQuery = await firestore.collectionGroup("comercios").where('city.subadmin', '==', customerAfter.address.city).get()
+
+        storesQuery.forEach(async (doc) => {
+            //doc.ref.set(store, {merge: true})
+            let store = await storeData(doc)
+            const areasStore = doc.data().areas
+            const locationCustomer = customerAfter.address.location           
+
+            for (const data of areasStore) {
+                console.log(data['name'])
+                var areas = []
+
+                for (const point of data['distributionArea']) {
+                    const latLng = { latitude: point.latitude, longitude: point.longitude }
+                    areas.push(latLng)
+                }
+                 
+                const response = geolib.isPointInPolygon({ latitude: locationCustomer.latitude, longitude: locationCustomer.longitude }, areas);
+                console.log(response)
+
+                if (response) {
+                    var queryStoresSearchs = await change.after.ref.collection("stores_copy").doc(store.id)
+                    queryStoresSearchs.set(store, {merge: true})
+                    
+                    return
+                }
+            }
+        });
+    }
+
+    return
+  })
+
